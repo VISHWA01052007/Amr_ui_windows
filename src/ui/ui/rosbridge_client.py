@@ -3,15 +3,13 @@ rosbridge_client.py
 -------------------
 Windows-side ROS 2 communication through rosbridge_websocket.
 
-Uses roslibpy with the Twisted reactor running in a background
-thread without installing OS signal handlers.
+Uses roslibpy's normal non-blocking `run()` API.
+roslibpy manages the WebSocket connection and reconnection.
 """
 
-import threading
 from typing import Optional, Callable, Dict
 
 import roslibpy
-from twisted.internet import reactor
 
 
 class RosbridgeClient:
@@ -30,27 +28,31 @@ class RosbridgeClient:
         self._on_connected = on_connected
         self._on_disconnected = on_disconnected
 
+        # One ROS connection object.
         self._ros: Optional[roslibpy.Ros] = None
 
-        self._thread: Optional[threading.Thread] = None
-
+        # Publisher/subscriber cache.
         self._topics: Dict[str, roslibpy.Topic] = {}
 
         self._running = False
         self._connected = False
-
-        self._lock = threading.Lock()
 
     # =========================================================
     # CONNECTION
     # =========================================================
 
     def connect(self) -> None:
+        """
+        Start the rosbridge connection.
+
+        IMPORTANT:
+        roslibpy.run() is non-blocking, so it is safe to call
+        from the PyQt main thread.
+        """
 
         if self._running:
             print(
-                "[ROSBRIDGE] Connection manager "
-                "already running."
+                "[ROSBRIDGE] Connection already running."
             )
             return
 
@@ -61,92 +63,39 @@ class RosbridgeClient:
             f"ws://{self.host}:{self.port}..."
         )
 
-        self._thread = threading.Thread(
-            target=self._run,
-            daemon=True,
-            name="RosbridgeThread",
-        )
-
-        self._thread.start()
-
-    def _run(self) -> None:
-        """
-        Create the Ros object and run Twisted without signal
-        handlers because this is NOT the Python main thread.
-        """
-
         try:
 
-            ros = roslibpy.Ros(
+            # Create ONE Ros connection.
+            self._ros = roslibpy.Ros(
                 host=self.host,
                 port=self.port,
             )
 
-            with self._lock:
-                self._ros = ros
-
-            ros.on_ready(
+            # Connection established callback.
+            self._ros.on_ready(
                 self._handle_connected
             )
 
-            # -------------------------------------------------
-            # IMPORTANT
-            #
-            # Do NOT use:
-            #
-            #     ros.run()
-            #
-            # because that attempts to install signal handlers.
-            #
-            # Instead, run Twisted's reactor directly and disable
-            # signal handlers.
-            # -------------------------------------------------
-
-            reactor.callWhenRunning(
-                self._start_ros_connection
+            # Connection closed callback.
+            self._ros.on(
+                "close",
+                self._handle_disconnected
             )
 
-            reactor.run(
-                installSignalHandlers=False
-            )
+            # IMPORTANT:
+            # run() is non-blocking.
+            self._ros.run()
 
         except Exception as e:
 
-            if self._running:
-
-                print(
-                    f"[ROSBRIDGE] Connection error: {e}"
-                )
-
-        finally:
-
-            if self._connected:
-
-                self._connected = False
-
-                if self._on_disconnected:
-                    self._on_disconnected()
-
-    def _start_ros_connection(self) -> None:
-        """
-        Start the roslibpy connection after the Twisted reactor
-        has started.
-        """
-
-        try:
-
-            if self._ros is not None:
-
-                # roslibpy's internal connection setup
-                self._ros._run()
-
-        except Exception as e:
+            self._running = False
 
             print(
-                f"[ROSBRIDGE] ROS startup error: {e}"
+                f"[ROSBRIDGE] Connection error: {e}"
             )
 
     def _handle_connected(self) -> None:
+        """Called when rosbridge connection is ready."""
 
         if not self._running:
             return
@@ -164,11 +113,32 @@ class RosbridgeClient:
         if self._on_connected:
             self._on_connected()
 
+    def _handle_disconnected(self, *args) -> None:
+        """
+        Called when the WebSocket connection closes.
+
+        We do NOT manually create another Ros object.
+        roslibpy handles reconnection.
+        """
+
+        if not self._connected:
+            return
+
+        self._connected = False
+
+        print(
+            "[ROSBRIDGE] Rosbridge connection lost."
+        )
+
+        if self._on_disconnected:
+            self._on_disconnected()
+
     # =========================================================
     # DISCONNECT
     # =========================================================
 
     def disconnect(self) -> None:
+        """Cleanly close the rosbridge connection."""
 
         if not self._running:
             return
@@ -178,11 +148,11 @@ class RosbridgeClient:
         )
 
         self._running = False
+        self._connected = False
 
         try:
 
             if self._ros is not None:
-
                 self._ros.terminate()
 
         except Exception as e:
@@ -191,32 +161,8 @@ class RosbridgeClient:
                 f"[ROSBRIDGE] Disconnect error: {e}"
             )
 
-        try:
-
-            if reactor.running:
-                reactor.callFromThread(
-                    reactor.stop
-                )
-
-        except Exception as e:
-
-            print(
-                f"[ROSBRIDGE] Reactor stop error: {e}"
-            )
-
-        if (
-            self._thread is not None
-            and self._thread.is_alive()
-            and self._thread is not threading.current_thread()
-        ):
-
-            self._thread.join(
-                timeout=2.0
-            )
-
-        self._thread = None
-
-        self._connected = False
+        self._ros = None
+        self._topics.clear()
 
         print(
             "[ROSBRIDGE] Disconnected cleanly."
@@ -228,14 +174,12 @@ class RosbridgeClient:
 
     @property
     def is_connected(self) -> bool:
-
-        with self._lock:
-            ros = self._ros
+        """Return True if rosbridge is currently connected."""
 
         return (
             self._connected
-            and ros is not None
-            and ros.is_connected
+            and self._ros is not None
+            and self._ros.is_connected
         )
 
     # =========================================================
@@ -255,23 +199,12 @@ class RosbridgeClient:
                 "rosbridge is not connected."
             )
 
+        # Return existing publisher.
         if topic_name in self._topics:
-
-            return self._topics[
-                topic_name
-            ]
-
-        with self._lock:
-            ros = self._ros
-
-        if ros is None:
-
-            raise RuntimeError(
-                "ROS connection is unavailable."
-            )
+            return self._topics[topic_name]
 
         topic = roslibpy.Topic(
-            ros,
+            self._ros,
             topic_name,
             message_type,
             reconnect_on_close=True,
@@ -279,9 +212,7 @@ class RosbridgeClient:
 
         topic.advertise()
 
-        self._topics[
-            topic_name
-        ] = topic
+        self._topics[topic_name] = topic
 
         print(
             f"[ROSBRIDGE] Publisher advertised: "
@@ -300,6 +231,7 @@ class RosbridgeClient:
         message_type: str,
         message: dict,
     ) -> bool:
+        """Publish a ROS message through rosbridge."""
 
         if not self.is_connected:
 
@@ -326,8 +258,8 @@ class RosbridgeClient:
         except Exception as e:
 
             print(
-                f"[ROSBRIDGE] Publish error "
-                f"on {topic_name}: {e}"
+                f"[ROSBRIDGE] Publish error on "
+                f"{topic_name}: {e}"
             )
 
             return False
