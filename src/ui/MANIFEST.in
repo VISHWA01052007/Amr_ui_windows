@@ -1,0 +1,2 @@
+recursive-include ui/resources *
+include package.xml
