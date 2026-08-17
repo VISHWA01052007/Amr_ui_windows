@@ -263,3 +263,57 @@ class RosbridgeClient:
             )
 
             return False
+
+    # =========================================================
+    # SUBSCRIBER
+    # =========================================================
+
+    def subscribe(
+        self,
+        topic_name: str,
+        message_type: str,
+        callback: Callable[[dict], None],
+    ) -> Optional[roslibpy.Topic]:
+        """
+        Subscribe to a ROS topic through rosbridge.
+
+        The received ROS message is passed to callback as
+        a normal Python dictionary.
+        """
+
+        if not self.is_connected:
+            print(
+                f"[ROSBRIDGE] Cannot subscribe to "
+                f"{topic_name}: not connected."
+            )
+            return None
+
+        # Return existing subscriber if already tracking
+        if topic_name in self._topics:
+            return self._topics[topic_name]
+
+        try:
+            topic = roslibpy.Topic(
+                self._ros,
+                topic_name,
+                message_type,
+                reconnect_on_close=True,
+            )
+
+            topic.subscribe(callback)
+
+            self._topics[topic_name] = topic
+
+            print(
+                f"[ROSBRIDGE] Subscriber created: "
+                f"{topic_name} [{message_type}]"
+            )
+
+            return topic
+
+        except Exception as e:
+            print(
+                f"[ROSBRIDGE] Subscribe error on "
+                f"{topic_name}: {e}"
+            )
+            return None

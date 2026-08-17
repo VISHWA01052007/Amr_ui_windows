@@ -45,6 +45,7 @@ class UINode:
             on_connected=self._on_rosbridge_connected,
             on_disconnected=self._on_rosbridge_disconnected,
         )
+        self._odom_sub = None
         self._rosbridge.connect()
 
         # 3. Bind Signal Routing Actions
@@ -65,9 +66,33 @@ class UINode:
         self._mission_log_controller.log_success("Connected to Robot Bridge.")
         print("[DEBUG UINODE] Rosbridge connection confirmed.")
 
+        # ✅ Subscribe to Odometry stream once the connection is established
+        self._odom_sub = self._rosbridge.subscribe(
+            topic_name=settings.ODOM_TOPIC,
+            message_type="nav_msgs/Odometry",
+            callback=self._odom_callback,
+        )
+
     def _on_rosbridge_disconnected(self) -> None:
+        # ✅ Reset status immediately when connection drops
+        self._robot_status_controller.set_offline()
         self._mission_log_controller.log_error("Lost connection to Robot Bridge.")
         print("[DEBUG UINODE] Rosbridge disconnected.")
+
+    def _odom_callback(self, msg: dict) -> None:
+        """
+        Receives /odom dict from rosbridge and updates RobotStatusController.
+        """
+        try:
+            linear_x = float(msg["twist"]["twist"]["linear"]["x"])
+            angular_z = float(msg["twist"]["twist"]["angular"]["z"])
+
+            self._robot_status_controller.update(
+                linear=linear_x,
+                angular=angular_z,
+            )
+        except (KeyError, TypeError, ValueError) as e:
+            print(f"[ERROR ODOM] Invalid /odom message format: {e}")
 
     def init_ui(self) -> None:
         self.window = MainWindow(
